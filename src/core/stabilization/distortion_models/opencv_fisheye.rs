@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2022 Adrian <adrian.eddy at gmail>
+
+// Adapted from OpenCV: https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/calib3d/src/fisheye.cpp#L257-L460
+
+use crate::stabilization::KernelParams;
+use super::{ Real, c };
+
+#[derive(Default, Clone)]
+pub struct OpenCVFisheye { }
+
+impl OpenCVFisheye {
+    /// `point`: normalized image coordinate `(recorded pixel - c) / f`. Returns the ray as an angle
+    /// vector (`θ·û`, see `stabilization::projection`)
+    pub fn undistort_point(&self, point: (f32, f32), params: &KernelParams) -> Option<(f32, f32)> {
+        if params.k[0] == 0.0 && params.k[1] == 0.0 && params.k[2] == 0.0 && params.k[3] == 0.0 {
+            // No calibration: a pinhole, so the image radius is `tan θ`
+            let r = (point.0 * point.0 + point.1 * point.1).sqrt();
+            if r < 1e-12 { return Some(point); }
+            let s = r.atan() / r;
+            return Some((point.0 * s, point.1 * s));
+        }
+
+        const EPS: f32 = 1e-6;
+
+        let mut theta_d = (point.0 * point.0 + point.1 * point.1).sqrt();
+
+        // the current camera model is only valid up to 180 FOV
+        // for larger FOV the loop below does not converge
+        // clip values so we still get plausible results for super fisheye images > 180 grad
+        theta_d = theta_d.max(-std::f32::consts::PI).min(std::f32::consts::PI);
+
+        let mut converged = false;
+        let mut theta = theta_d;
+
+        let mut scale = 0.0;
+
+        if theta_d.abs() > EPS {
+            theta = 0.0;
+
+            // compensate distortion iteratively
+            for _ in 0..15 {
+                let theta2 = theta*theta;
+                let theta4 = theta2*theta2;
+                let theta6 = theta4*theta2;
+                let theta8 = theta6*theta2;
+                let k0_theta2 = params.k[0] * theta2;
+                let k1_theta4 = params.k[1] * theta4;
+                let k2_theta6 = params.k[2] * theta6;
+                let k3_theta8 = params.k[3] * theta8;
+                // new_theta = theta - theta_fix, theta_fix = f0(theta) / f0'(theta)
+                let mut theta_fix = (theta * (1.0 + k0_theta2 + k1_theta4 + k2_theta6 + k3_theta8) - theta_d)
+                                /
+                                (1.0 + 3.0 * k0_theta2 + 5.0 * k1_theta4 + 7.0 * k2_theta6 + 9.0 * k3_theta8);
+
+                theta_fix = theta_fix.max(-0.9).min(0.9);
+
+                theta = theta - theta_fix;
+                if theta_fix.abs() < EPS {
+                    converged = true;
+                    break;
+                }
+            }
+
+            scale = theta / theta_d;
+        } else {
+            converged = true;
+        }
+
+        // theta is monotonously increasing or decreasing depending on the sign of theta
+        // if theta has flipped, it might converge due to symmetry but on the opposite of the camera center
+        // so we can check whether theta has changed the sign during the optimization
+        let theta_flipped = (theta_d < 0.0 && theta > 0.0) || (theta_d > 0.0 && theta < 0.0);
+
+        // Nothing past 180° is a ray the pipeline can carry: `projection::ray_to_dir` builds the direction
+        // out of `sin θ`, which turns over there, so an angle the Newton wandered past it comes back as a
+        // bearing from *behind* the camera - and the sync, which reads these as bearings with no field
+        // clamp at all, would then fit a rotation to it. A mildly compressive calibration is enough:
+        // `k[0] = -0.005` puts `r(π)` at 2.99, so a point at normalized radius π solves to 191°.
+        // The rejection this replaces stopped at 90°, where the old z=1 plane ray ran out of `tan`; how
+        // far the lens itself reaches is `radial_distortion_limit`'s business, and this is only where the
+        // representation ends
+        if theta.abs() >= std::f32::consts::PI { return None; }
+
+        if converged && !theta_flipped {
+            return Some((point.0 * scale, point.1 * scale));
+        }
+        None
+    }
+
+    /// `(x, y, z)`: the ray direction; returns the normalized image coordinate (× f + c → recorded pixel)
+    pub fn distort_point(&self, x: f32, y: f32, z: f32, params: &KernelParams) -> (f32, f32) {
+        // No calibration: a pinhole, which has no image of a ray at or past 90°
+        if params.k[0] == 0.0 && params.k[1] == 0.0 && params.k[2] == 0.0 && params.k[3] == 0.0 {
+            return if z > 1e-9 { (x / z, y / z) } else { (x * 1e9, y * 1e9) };
+        }
+        Self::distort(x, y, z, &params.k)
+    }
+
+    /// The projection itself, in either precision (see `Real`). All-zero `k` is the equidistant lens here: the
+    /// "uncalibrated means pinhole" convention is `distort_point`'s
+    pub fn distort<T: Real>(x: T, y: T, z: T, k: &[T]) -> (T, T) {
+        let r = (x * x + y * y).sqrt();
+
+        // atan2 against the ray's own z, so the angle is right past 90° too
+        let theta = r.atan2(z);
+        let theta2 = theta*theta;
+        let theta4 = theta2*theta2;
+        let theta6 = theta4*theta2;
+        let theta8 = theta4*theta4;
+
+        let theta_d = theta * (c::<T>(1.0) + k[0]*theta2 + k[1]*theta4 + k[2]*theta6 + k[3]*theta8);
+
+        let scale = if r < c(1e-12) { c(1.0) } else { theta_d / r };
+
+        (
+            x * scale,
+            y * scale
+        )
+    }
+
+    pub fn adjust_lens_profile(&self, _profile: &mut crate::LensProfile) { }
+
+    /// `d(image radius)/dθ`, `<= 0` where the radial curve folds
+    pub fn distortion_derivative(&self, theta: f64, k: &[f64]) -> Option<f64> {
+        if k.len() < 4 { return None; }
+        let theta2 = theta * theta;
+        let theta4 = theta2 * theta2;
+        let theta6 = theta4 * theta2;
+        let theta8 = theta6 * theta2;
+        Some(
+            1.0 + 3.0 * k[0] * theta2 + 5.0 * k[1] * theta4 + 7.0 * k[2] * theta6 + 9.0 * k[3] * theta8
+        )
+    }
+
+    pub fn id() -> &'static str { "opencv_fisheye" }
+    pub fn name() -> &'static str { "OpenCV Fisheye" }
+
+    pub fn opencl_functions(&self) -> &'static str { include_str!("opencv_fisheye.cl") }
+    pub fn wgsl_functions(&self)   -> &'static str { include_str!("opencv_fisheye.wgsl") }
+}
